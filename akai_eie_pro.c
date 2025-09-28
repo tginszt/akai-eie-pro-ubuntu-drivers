@@ -31,8 +31,8 @@ static unsigned int devices_used;
 static struct usb_driver eie_driver;
 
 #define SYNC_URB_CNT 2
-#define PLAY_URB_CNT 6  /* Increased from 4 for better buffering and smoother playback */
-#define PLAY_PKT_CNT 20  /* Reduced from 40 for lower latency and smoother audio */
+#define PLAY_URB_CNT 4
+#define PLAY_PKT_CNT 40
 #define CAP_URB_CNT 2
 
 #define BYTES_PER_FRAME 12
@@ -317,9 +317,9 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 	unsigned char *start;
 	int i;
 
-	/* Use hardware feedback if reasonable - more lenient tolerance for stability */
-	if ((frames_elapsed > frames_wanted - 5)
-		&& (frames_elapsed < frames_wanted + 5)
+	/* Use hardware feedback if reasonable - tighter tolerance for stability */
+	if ((frames_elapsed > frames_wanted - 1)
+		&& (frames_elapsed < frames_wanted + 1)
 		&& frames_elapsed > 0) {
 		frames_wanted = frames_elapsed;
 	}
@@ -354,10 +354,11 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 		epu->silent = false;
 		epu->len = frames_wanted;
 	} else {
-		/* When not playing, send consistent silence to avoid glitches */
-		memset(urb->transfer_buffer, 0, bytes_wanted);
-		epu->len = frames_wanted;
-		epu->silent = true;
+		if (!epu->silent && frames_wanted <= epu->len) {
+			memset(urb->transfer_buffer, 0, bytes_wanted);
+			epu->len = frames_wanted;
+			epu->silent = true;
+		}
 	}
 
 	/* Setup ISO frame descriptors */
