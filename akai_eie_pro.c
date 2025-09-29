@@ -548,45 +548,45 @@ static void cap_urb_complete(struct urb *urb)
 				if (format == SNDRV_PCM_FORMAT_S32_LE) {
 					__le32 *out32 = (__le32 *)out;
 					if (channels == 4) {
-						/* Apply 8x gain (3 bits left shift) for better levels */
-						out32[0] = cpu_to_le32(ch1 << 3);
-						out32[1] = cpu_to_le32(ch2 << 3);
-						out32[2] = cpu_to_le32(ch3 << 3);
-						out32[3] = cpu_to_le32(ch4 << 3);
+						/* Raw values are 24-bit, keep them in lower bits for S32_LE to prevent over-ranging */
+						out32[0] = cpu_to_le32(ch1);  
+						out32[1] = cpu_to_le32(ch2);
+						out32[2] = cpu_to_le32(ch3);
+						out32[3] = cpu_to_le32(ch4);
 					} else if (channels == 2) {
-						/* Use first two channels directly for stereo with gain */
-						out32[0] = cpu_to_le32(ch1 << 3);
-						out32[1] = cpu_to_le32(ch2 << 3);
+						/* Use first two channels directly for stereo */
+						out32[0] = cpu_to_le32(ch1);
+						out32[1] = cpu_to_le32(ch2);
 					} else if (channels == 1) {
-						/* Use first channel for mono with gain */
-						out32[0] = cpu_to_le32(ch1 << 3);
+						/* Use first channel for mono */
+						out32[0] = cpu_to_le32(ch1);
 					}
 				} else if (format == SNDRV_PCM_FORMAT_S24_LE) {
 					if (channels == 4) {
-						/* Apply 4x gain (2 bits left shift) for 24-bit */
-						*((__le32 *)&out[0]) = cpu_to_le32(((ch1 << 2) >> 8) & 0x00ffffff);
-						*((__le32 *)&out[3]) = cpu_to_le32(((ch2 << 2) >> 8) & 0x00ffffff);
-						*((__le32 *)&out[6]) = cpu_to_le32(((ch3 << 2) >> 8) & 0x00ffffff);
-						*((__le32 *)&out[9]) = cpu_to_le32(((ch4 << 2) >> 8) & 0x00ffffff);
+						/* For S24_LE, use the raw 24-bit values directly (like pokus.c) */
+						*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
+						*((__le32 *)&out[3]) = cpu_to_le32(ch2 & 0x00ffffff);
+						*((__le32 *)&out[6]) = cpu_to_le32(ch3 & 0x00ffffff);
+						*((__le32 *)&out[9]) = cpu_to_le32(ch4 & 0x00ffffff);
 					} else if (channels == 2) {
-						*((__le32 *)&out[0]) = cpu_to_le32(((ch1 << 2) >> 8) & 0x00ffffff);
-						*((__le32 *)&out[3]) = cpu_to_le32(((ch2 << 2) >> 8) & 0x00ffffff);
+						*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
+						*((__le32 *)&out[3]) = cpu_to_le32(ch2 & 0x00ffffff);
 					} else if (channels == 1) {
-						*((__le32 *)&out[0]) = cpu_to_le32(((ch1 << 2) >> 8) & 0x00ffffff);
+						*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
 					}
 				} else if (format == SNDRV_PCM_FORMAT_S16_LE) {
 					__le16 *out16 = (__le16 *)out;
 					if (channels == 4) {
-						/* Apply 4x gain for 16-bit by using upper bits */
-						out16[0] = cpu_to_le16((ch1 << 2) >> 16);
-						out16[1] = cpu_to_le16((ch2 << 2) >> 16);
-						out16[2] = cpu_to_le16((ch3 << 2) >> 16);
-						out16[3] = cpu_to_le16((ch4 << 2) >> 16);
+						/* For S16_LE, use upper 16 bits of the 24-bit values */
+						out16[0] = cpu_to_le16(ch1 >> 16);
+						out16[1] = cpu_to_le16(ch2 >> 16);
+						out16[2] = cpu_to_le16(ch3 >> 16);
+						out16[3] = cpu_to_le16(ch4 >> 16);
 					} else if (channels == 2) {
-						out16[0] = cpu_to_le16((ch1 << 2) >> 16);
-						out16[1] = cpu_to_le16((ch2 << 2) >> 16);
+						out16[0] = cpu_to_le16(ch1 >> 16);
+						out16[1] = cpu_to_le16(ch2 >> 16);
 					} else if (channels == 1) {
-						out16[0] = cpu_to_le16((ch1 << 2) >> 16);
+						out16[0] = cpu_to_le16(ch1 >> 16);
 					}
 				}
 				
