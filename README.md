@@ -266,8 +266,9 @@ arecord -l | grep -i eie
 ./reload.sh --force
 ```
 
-**4. Volume spikes after reload**
-This is normal - PipeWire's automatic gain control adjusts levels. The force reload script now sets 50% volume immediately to prevent spikes.
+**4. Plucking on driver load**
+Be it on system start or manual reload via reload.sh
+It is short lasting and not intrusive. Sometimes audio devices even reload few times but when it settles down all works fine.
 
 ### Debug Mode
 Enable detailed logging:
