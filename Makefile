@@ -26,35 +26,6 @@ clean:
 	$(MAKE) -C $(KERNEL_SRC) M=$(PWD) clean
 	rm -f Module.symvers modules.order
 
-# Install the module (requires root)
-install: modules
-	@echo "Installing module..."
-	sudo cp $(MODULE_NAME).ko /lib/modules/$(shell uname -r)/extra/
-	sudo depmod -a
-	@echo "Module installed. Load with: sudo modprobe $(MODULE_NAME)"
-
-# Uninstall the module
-uninstall:
-	@echo "Uninstalling module..."
-	sudo rm -f /lib/modules/$(shell uname -r)/extra/$(MODULE_NAME).ko
-	sudo depmod -a
-	@echo "Module uninstalled."
-
-# Load the module
-load: modules
-	@echo "Loading module..."
-	sudo insmod $(MODULE_NAME).ko
-	@echo "Module loaded. Check dmesg for output."
-
-# Unload the module
-unload:
-	@echo "Unloading module..."
-	sudo rmmod $(MODULE_NAME)
-	@echo "Module unloaded."
-
-# Reload the module (unload + load)
-reload: unload load
-
 # Show module info
 info: modules
 	@echo "Module information:"
@@ -96,11 +67,6 @@ help:
 	@echo "  all         - Build the kernel module (default)"
 	@echo "  modules     - Build the kernel module"
 	@echo "  clean       - Clean build artifacts"
-	@echo "  install     - Install module to system (requires root)"
-	@echo "  uninstall   - Remove module from system (requires root)"
-	@echo "  load        - Load the module"
-	@echo "  unload      - Unload the module"
-	@echo "  reload      - Unload and reload the module"
 	@echo "  info        - Show module information"
 	@echo "  status      - Check if module is loaded"
 	@echo "  log         - Show recent kernel log messages"
@@ -108,14 +74,21 @@ help:
 	@echo "  check-headers - Verify kernel headers are available"
 	@echo "  help        - Show this help message"
 	@echo ""
+	@echo "For loading/reloading the module:"
+	@echo "  ./reload.sh             # Smart reload for development"
+	@echo "  ./reload.sh --force     # Force reload (stubborn situations)"
+	@echo ""
+	@echo "For permanent installation:"
+	@echo "  ./install.sh            # Install permanently with auto-loading"
+	@echo ""
 	@echo "Usage examples:"
 	@echo "  make                    # Build the module"
-	@echo "  make load               # Build and load module"
-	@echo "  make reload             # Rebuild and reload module"
-	@echo "  make clean install      # Clean build and install"
+	@echo "  make status             # Check if module is loaded"
+	@echo "  ./reload.sh             # Smart reload for development"
+	@echo "  ./install.sh            # Install permanently with auto-loading"
 
 # Phony targets
-.PHONY: all modules clean install uninstall load unload reload info status log debug check-headers help
+.PHONY: all modules clean info status log debug check-headers help
 
 # Additional build flags (uncomment as needed)
 # EXTRA_CFLAGS += -DDEBUG                    # Enable debug messages
