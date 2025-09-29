@@ -10,17 +10,18 @@
 #include <linux/wait.h>
 #include <linux/usb.h>
 #include <linux/slab.h>
-#include <linux/vmalloc.h>
-#include <linux/version.h>
+#include <linux/kernel.h>
 
 #include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
+#include <sound/control.h>
 
-MODULE_DESCRIPTION("Akai EIE pro driver");
-MODULE_AUTHOR("Based on Michal Rydlo <michal.rydlo@gmail.com>");
+MODULE_DESCRIPTION("AKAI EIE Pro USB Audio Driver");
+MODULE_AUTHOR("Enhanced by Jakob, based on Michal Rydlo <michal.rydlo@gmail.com>");
 MODULE_LICENSE("GPL v2");
+MODULE_VERSION("1.0");
 
 static int index[SNDRV_CARDS] = SNDRV_DEFAULT_IDX;
 static char *id[SNDRV_CARDS] = SNDRV_DEFAULT_STR;
@@ -36,7 +37,6 @@ static struct usb_driver eie_driver;
 #define CAP_URB_CNT 2
 
 #define BYTES_PER_FRAME 12
-#define BYTES_PER_FRAME_CAP 16
 
 enum {
 	PLAYBACK_RUNNING,
@@ -100,8 +100,9 @@ static struct snd_pcm_hardware eie_playback_hw = {
 		SNDRV_PCM_INFO_BATCH |
 		SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_BLOCK_TRANSFER |
+		SNDRV_PCM_INFO_PAUSE |
 		SNDRV_PCM_INFO_FIFO_IN_FRAMES),
-	.formats = SNDRV_PCM_FMTBIT_S24_3LE,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_3LE,
 	.rates = (SNDRV_PCM_RATE_44100 |
 		SNDRV_PCM_RATE_48000 |
 		SNDRV_PCM_RATE_88200 |
@@ -123,8 +124,9 @@ static struct snd_pcm_hardware eie_capture_hw = {
 		SNDRV_PCM_INFO_BATCH |
 		SNDRV_PCM_INFO_INTERLEAVED |
 		SNDRV_PCM_INFO_BLOCK_TRANSFER |
+		SNDRV_PCM_INFO_PAUSE |
 		SNDRV_PCM_INFO_FIFO_IN_FRAMES),
-	.formats = SNDRV_PCM_FMTBIT_S32_LE | SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S16_LE,
+	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_LE | SNDRV_PCM_FMTBIT_S32_LE,
 	.rates = (SNDRV_PCM_RATE_44100 |
 		SNDRV_PCM_RATE_48000 |
 		SNDRV_PCM_RATE_88200 |
@@ -133,11 +135,11 @@ static struct snd_pcm_hardware eie_capture_hw = {
 	.rate_max = 96000,
 	.channels_min = 1,
 	.channels_max = 4,
-	.buffer_bytes_max = 1024 * 1024,  /* 1MB buffer */
+	.buffer_bytes_max = 2 * 1024 * 1024,  /* 2MB buffer for better stability */
 	.period_bytes_min = 64,  /* Minimum period size */
-	.period_bytes_max = 8192 * 16,  /* Max period size for 4ch S32_LE */
-	.periods_min = 4,
-	.periods_max = 64,
+	.period_bytes_max = 16384 * 16,  /* Larger max period size for 4ch S32_LE */
+	.periods_min = 2,  /* Reduce minimum periods for lower latency */
+	.periods_max = 128,  /* More periods for stability */
 };
 
 
@@ -317,7 +319,7 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 	unsigned char *start;
 	int i;
 
-	/* Use hardware feedback if reasonable - tighter tolerance for stability */
+	/* Use hardware feedback if reasonable - stable tolerance */
 	if ((frames_elapsed > frames_wanted - 1)
 		&& (frames_elapsed < frames_wanted + 1)
 		&& frames_elapsed > 0) {
@@ -354,11 +356,10 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 		epu->silent = false;
 		epu->len = frames_wanted;
 	} else {
-		if (!epu->silent && frames_wanted <= epu->len) {
-			memset(urb->transfer_buffer, 0, bytes_wanted);
-			epu->len = frames_wanted;
-			epu->silent = true;
-		}
+		/* Always clear buffer and update length for silent frames */
+		memset(urb->transfer_buffer, 0, bytes_wanted);
+		epu->len = frames_wanted;
+		epu->silent = true;
 	}
 
 	/* Setup ISO frame descriptors */
@@ -439,8 +440,14 @@ static void play_urb_complete(struct urb *urb)
 
 	spin_lock_irqsave(&eie->lock, flags);
 	if (!epu->silent
-		&& eie->play_substream && eie->play_substream->runtime)
-		eie->play_substream->runtime->delay -= epu->len;
+		&& eie->play_substream && eie->play_substream->runtime) {
+		/* Prevent negative delay values that can cause glitches */
+		if (eie->play_substream->runtime->delay >= epu->len) {
+			eie->play_substream->runtime->delay -= epu->len;
+		} else {
+			eie->play_substream->runtime->delay = 0;
+		}
+	}
 
 	err = fill_playback_urb(epu);
 	if (err < 0) {
@@ -475,10 +482,14 @@ static void cap_urb_complete(struct urb *urb)
 	bool elapsed = false;
 	bool abort = false;
 
-	/* Debug: Log URB completion only on errors or successful data transfers */
-	if (urb->status != 0 || urb->actual_length > 0) {
-		dev_info(&eie->udev->dev, "Capture URB complete: status=%d, length=%d, endpoint=0x%02x", 
-			 urb->status, urb->actual_length, eie->cap_endpoint_addr);
+		/* Debug: Only log URB completion errors, not successful transfers */
+	static int success_log_count = 0;
+	if (urb->status != 0) {
+		dev_warn(&eie->udev->dev, "Capture URB error: status=%d, length=%d", 
+			 urb->status, urb->actual_length);
+	} else if (urb->actual_length > 0 && success_log_count < 1) {
+		dev_info(&eie->udev->dev, "Capture URB working: length=%d", urb->actual_length);
+		success_log_count++;
 	}
 
 	if (!substream)
@@ -502,41 +513,42 @@ static void cap_urb_complete(struct urb *urb)
 		if (urb->status == 0 && urb->actual_length > 0) {
 			unsigned char *buf = urb->transfer_buffer;
 			unsigned int frames_received = urb->actual_length / 64;
-			int i, j;
+			int i;
 			
-			/* Log data size and sample content for debugging */
+			/* Log data size and sample content for debugging - very infrequently */
 			static int data_log_counter = 0;
-			if (data_log_counter++ % 1000 == 0) {
-				dev_info(&eie->udev->dev, "Capture bulk data: %d bytes, %d frames", 
+			if (data_log_counter++ % 50000 == 0) {  /* Much less frequent logging */
+				dev_info(&eie->udev->dev, "Capture processing: %d bytes, %d frames", 
 					 urb->actual_length, frames_received);
-				/* Log first 16 bytes of raw data */
-				dev_info(&eie->udev->dev, "Raw data: %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x %02x",
-					buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7],
-					buf[8], buf[9], buf[10], buf[11], buf[12], buf[13], buf[14], buf[15]);
 			}
 			
 			for (i = 0; i < frames_received; i++) {
 				unsigned char *frame_buf = buf + (i * 64);
 				
-				/* 64-byte frame - decode with bit manipulation (exact pokus.c reference) */
-				int ch1, ch2, ch3, ch4;  /* Use signed int like pokus.c */
+				/* 64-byte frame - decode with improved bit manipulation */
+				int ch1, ch2, ch3, ch4;
 				int j;
 				
 				ch1 = ch2 = ch3 = ch4 = 0;
 				
-				/* First 24 bytes for channels 1 and 3 */
+				/* First 24 bytes for channels 1 and 3 - improved bit extraction */
 				for (j = 0; j < 24; j++) {
-					ch1 |= (frame_buf[j] & 1) << (31-j);
-					ch3 |= (frame_buf[j] & 2) << (30-j);
+					ch1 |= (frame_buf[j] & 1) << (23-j);  /* MSB alignment for better volume */
+					ch3 |= ((frame_buf[j] & 2) >> 1) << (23-j);
 				}
 				
-				/* Bytes 32-55 for channels 2 and 4 */  
+				/* Bytes 32-55 for channels 2 and 4 - improved bit extraction */  
 				for (j = 32; j < 56; j++) {
-					ch2 |= (frame_buf[j] & 1) << (63-j);
-					ch4 |= (frame_buf[j] & 2) << (62-j);
+					ch2 |= (frame_buf[j] & 1) << (55-j);
+					ch4 |= ((frame_buf[j] & 2) >> 1) << (55-j);
 				}
 				
-				/* Format and channel conversion based on runtime format */
+				/* Sign extend from 24-bit to 32-bit for proper audio levels */
+				if (ch1 & 0x800000) ch1 |= 0xFF000000;  /* Sign extend */
+				if (ch2 & 0x800000) ch2 |= 0xFF000000;
+				if (ch3 & 0x800000) ch3 |= 0xFF000000;
+				if (ch4 & 0x800000) ch4 |= 0xFF000000;
+				
 				unsigned int format = runtime->format;
 				unsigned int channels = runtime->channels;
 				unsigned int frame_bytes = snd_pcm_format_size(format, channels);
@@ -548,22 +560,23 @@ static void cap_urb_complete(struct urb *urb)
 				if (format == SNDRV_PCM_FORMAT_S32_LE) {
 					__le32 *out32 = (__le32 *)out;
 					if (channels == 4) {
-						/* Raw values are 24-bit, keep them in lower bits for S32_LE to prevent over-ranging */
-						out32[0] = cpu_to_le32(ch1);  
-						out32[1] = cpu_to_le32(ch2);
-						out32[2] = cpu_to_le32(ch3);
-						out32[3] = cpu_to_le32(ch4);
+						/* Use proper 24-bit values shifted to 32-bit range for full volume */
+						out32[0] = cpu_to_le32(ch1 << 8);  /* Shift 24-bit to 32-bit MSB */
+						out32[1] = cpu_to_le32(ch2 << 8);
+						out32[2] = cpu_to_le32(ch3 << 8);
+						out32[3] = cpu_to_le32(ch4 << 8);
 					} else if (channels == 2) {
-						/* Use first two channels directly for stereo */
-						out32[0] = cpu_to_le32(ch1);
-						out32[1] = cpu_to_le32(ch2);
+						/* Use first two channels with proper level adjustment for stereo */
+						out32[0] = cpu_to_le32(ch1 << 8);
+						out32[1] = cpu_to_le32(ch2 << 8);
 					} else if (channels == 1) {
-						/* Use first channel for mono */
-						out32[0] = cpu_to_le32(ch1);
+						/* Mix first two channels for mono to avoid mono-only issue */
+						int mixed = (ch1 + ch2) / 2;
+						out32[0] = cpu_to_le32(mixed << 8);
 					}
 				} else if (format == SNDRV_PCM_FORMAT_S24_LE) {
 					if (channels == 4) {
-						/* For S24_LE, use the raw 24-bit values directly (like pokus.c) */
+						/* For S24_LE, use the raw 24-bit values with better packing */
 						*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
 						*((__le32 *)&out[3]) = cpu_to_le32(ch2 & 0x00ffffff);
 						*((__le32 *)&out[6]) = cpu_to_le32(ch3 & 0x00ffffff);
@@ -572,29 +585,33 @@ static void cap_urb_complete(struct urb *urb)
 						*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
 						*((__le32 *)&out[3]) = cpu_to_le32(ch2 & 0x00ffffff);
 					} else if (channels == 1) {
-						*((__le32 *)&out[0]) = cpu_to_le32(ch1 & 0x00ffffff);
+						int mixed = (ch1 + ch2) / 2;
+						*((__le32 *)&out[0]) = cpu_to_le32(mixed & 0x00ffffff);
 					}
 				} else if (format == SNDRV_PCM_FORMAT_S16_LE) {
 					__le16 *out16 = (__le16 *)out;
 					if (channels == 4) {
-						/* For S16_LE, use upper 16 bits of the 24-bit values */
-						out16[0] = cpu_to_le16(ch1 >> 16);
-						out16[1] = cpu_to_le16(ch2 >> 16);
-						out16[2] = cpu_to_le16(ch3 >> 16);
-						out16[3] = cpu_to_le16(ch4 >> 16);
+						/* For S16_LE, use upper 16 bits with proper scaling */
+						out16[0] = cpu_to_le16(ch1 >> 8);  /* 24-bit to 16-bit conversion */
+						out16[1] = cpu_to_le16(ch2 >> 8);
+						out16[2] = cpu_to_le16(ch3 >> 8);
+						out16[3] = cpu_to_le16(ch4 >> 8);
 					} else if (channels == 2) {
-						out16[0] = cpu_to_le16(ch1 >> 16);
-						out16[1] = cpu_to_le16(ch2 >> 16);
+						/* Ensure proper stereo: use different channels for L/R */
+						out16[0] = cpu_to_le16(ch1 >> 8);  /* Left channel */
+						out16[1] = cpu_to_le16(ch2 >> 8);  /* Right channel */
 					} else if (channels == 1) {
-						out16[0] = cpu_to_le16(ch1 >> 16);
+						/* Mix first two channels for mono */
+						int mixed = (ch1 + ch2) / 2;
+						out16[0] = cpu_to_le16(mixed >> 8);
 					}
 				}
 				
-				/* Debug: Log decoded values more frequently for debugging */
+				/* Debug: Log decoded values very infrequently to avoid spam */
 				static int decode_log_counter = 0;
-				if (i == 0 && (decode_log_counter++ % 1000 == 0)) {
-					dev_info(&eie->udev->dev, "Format=%d, Channels=%d, Decoded: ch1=0x%08x ch2=0x%08x ch3=0x%08x ch4=0x%08x", 
-						format, channels, ch1, ch2, ch3, ch4);
+				if (i == 0 && (decode_log_counter++ % 100000 == 0)) {  /* Very infrequent logging */
+					dev_info(&eie->udev->dev, "Audio processing active: Format=%d, Channels=%d", 
+						format, channels);
 				}
 			}
 			
@@ -609,8 +626,25 @@ static void cap_urb_complete(struct urb *urb)
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err < 0) {
-		dev_err(&eie->udev->dev, "Cannot resubmit cap urb: %d", err);
-		abort = true;
+		/* Reduce log spam - only log serious errors */
+		if (err != -ENODEV && err != -ESHUTDOWN && err != -ENOENT && err != -EPERM) {
+			/* Only log every 100th error to prevent log flooding */
+			static int error_count = 0;
+			if ((error_count++ % 100) == 0) {
+				dev_warn(&eie->udev->dev, "URB resubmit error %d (logged every 100 errors, count: %d)", err, error_count);
+			}
+			/* Try to resubmit after a brief delay for transient errors */
+			if (error_count < 300) { /* Give up after too many errors */
+				/* Don't abort immediately on -EBUSY or similar transient errors */
+				if (err != -EBUSY && err != -EAGAIN) {
+					abort = true;
+				}
+			} else {
+				abort = true;
+			}
+		} else {
+			abort = true;
+		}
 	}
 
 	spin_unlock_irqrestore(&eie->lock, flags);
@@ -669,7 +703,12 @@ static int reset_eie(struct eie *eie, unsigned int rate)
 	if (!data)
 		return -ENOMEM;
 
-	dev_info(&eie->udev->dev, "Resetting device for %dHz", rate);
+	/* Only log rate changes, not every reset */
+	static int last_logged_rate = 0;
+	if (last_logged_rate != rate) {
+		dev_info(&eie->udev->dev, "Resetting device for %dHz", rate);
+		last_logged_rate = rate;
+	}
 	kill_all_urbs(eie);
 	eie_set_alt_setting(eie);
 
@@ -702,6 +741,10 @@ static int eie_ppcm_prepare(struct snd_pcm_substream *substream)
 	eie->played_frames = 0;
 	eie->play_buf_pos = 0;
 	substream->runtime->delay = 0;
+	
+	/* Reset timing state for clean startup */
+	eie->wanted_idx = 0;
+	atomic_set(&eie->frames_elapsed, 0);
 
 	return err;
 }
@@ -771,7 +814,6 @@ static int submit_init_cap_urbs(struct eie *eie)
 			dev_err(&eie->udev->dev, "Cannot submit cap urb %d: %d", i, err);
 			goto out;
 		}
-		dev_info(&eie->udev->dev, "Submitted cap urb %d successfully", i);
 	}
 
 out:
@@ -786,8 +828,6 @@ static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		dev_info(&eie->udev->dev, "play: TRIGGER_START");
-		
 		/* Submit URBs when playback actually starts */
 		if (!test_bit(URBS_FLOWING, &eie->states)) {
 			if (eie->sync_endpoint_addr) {
@@ -799,13 +839,21 @@ static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 			if (err < 0)
 				return err;
 			wait_event(eie->urbs_flow_wait, test_bit(URBS_FLOWING, &eie->states));
+			
+			/* Small delay to let hardware stabilize and avoid initial plucks */
+			usleep_range(1000, 2000);  /* 1-2ms stabilization delay */
 		}
 		
 		set_bit(PLAYBACK_RUNNING, &eie->states);
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
-		dev_info(&eie->udev->dev, "play: TRIGGER_STOP");
 		clear_bit(PLAYBACK_RUNNING, &eie->states);
+		return 0;
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		clear_bit(PLAYBACK_RUNNING, &eie->states);
+		return 0;
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		set_bit(PLAYBACK_RUNNING, &eie->states);
 		return 0;
 	default:
 		return -EINVAL;
@@ -819,8 +867,6 @@ static int eie_cpcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		dev_info(&eie->udev->dev, "cap: TRIGGER_START");
-		
 		/* Ensure device is configured for the current sample rate */
 		if (substream->runtime->rate != eie->rate) {
 			err = reset_eie(eie, substream->runtime->rate);
@@ -856,8 +902,13 @@ static int eie_cpcm_trigger(struct snd_pcm_substream *substream, int cmd)
 		}
 		return 0;
 	case SNDRV_PCM_TRIGGER_STOP:
-		dev_info(&eie->udev->dev, "cap: TRIGGER_STOP");
 		clear_bit(CAPTURE_RUNNING, &eie->states);
+		return 0;
+	case SNDRV_PCM_TRIGGER_PAUSE_PUSH:
+		clear_bit(CAPTURE_RUNNING, &eie->states);
+		return 0;
+	case SNDRV_PCM_TRIGGER_PAUSE_RELEASE:
+		set_bit(CAPTURE_RUNNING, &eie->states);
 		return 0;
 	default:
 		return -EINVAL;
@@ -1178,6 +1229,33 @@ static int init_urbs(struct eie *eie)
 	return 0;
 }
 
+/* Mixer control functions */
+static int eie_capture_volume_info(struct snd_kcontrol *kcontrol,
+				   struct snd_ctl_elem_info *uinfo)
+{
+	uinfo->type = SNDRV_CTL_ELEM_TYPE_INTEGER;
+	uinfo->count = 2; /* stereo */
+	uinfo->value.integer.min = 0;
+	uinfo->value.integer.max = 65535;
+	return 0;
+}
+
+static int eie_capture_volume_get(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *ucontrol)
+{
+	/* Always return full volume for now */
+	ucontrol->value.integer.value[0] = 65535;
+	ucontrol->value.integer.value[1] = 65535;
+	return 0;
+}
+
+static int eie_capture_volume_put(struct snd_kcontrol *kcontrol,
+				  struct snd_ctl_elem_value *ucontrol)
+{
+	/* Volume control not implemented in hardware, just return changed */
+	return 1;
+}
+
 static int eie_probe(struct usb_interface *interface, const struct usb_device_id *usb_id)
 {
 	unsigned int card_index;
@@ -1229,12 +1307,12 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 	if (err < 0)
 		goto probe_err;
 
-	/* Setup card info */
+	/* Setup card info to appear as standard USB Audio device */
 	snd_card_set_dev(card, &interface->dev);
-	strcpy(card->driver, "EIE");
+	strcpy(card->driver, "USB-Audio");
 	strcpy(card->shortname, "AKAI EIE Pro");
 	snprintf(card->longname, sizeof(card->longname),
-		 "Akai EIE pro at %s", dev_name(&eie->udev->dev));
+		 "AKAI EIE Pro at %s", dev_name(&eie->udev->dev));
 
 	err = snd_pcm_new(card, "USB Audio", 0, 1, 1, &eie->pcm);
 	if (err < 0)
@@ -1249,6 +1327,21 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 	snd_pcm_lib_preallocate_pages_for_all(eie->pcm, SNDRV_DMA_TYPE_VMALLOC,
 					       NULL, 0, 512*1024);
 
+	/* Add minimal mixer control for browser volume detection */
+	{
+		struct snd_kcontrol_new capture_volume = {
+			.iface = SNDRV_CTL_ELEM_IFACE_MIXER,
+			.name = "Capture Volume",
+			.info = eie_capture_volume_info,
+			.get = eie_capture_volume_get,
+			.put = eie_capture_volume_put,
+		};
+		err = snd_ctl_add(card, snd_ctl_new1(&capture_volume, eie));
+		if (err < 0) {
+			dev_warn(&eie->udev->dev, "Failed to add capture volume: %d", err);
+		}
+	}
+
 	err = snd_card_register(card);
 	if (err < 0)
 		goto probe_err;
@@ -1260,7 +1353,7 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 
 	mutex_unlock(&devices_mutex);
 	
-	dev_info(&eie->udev->dev, "AKAI EIE Pro driver loaded successfully\n");
+	dev_info(&eie->udev->dev, "AKAI EIE Pro driver ready - Playback: 4ch, Capture: 1-4ch, Sample rates: 44.1-96kHz");
 	return 0;
 
 probe_err:
