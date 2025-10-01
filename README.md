@@ -2,6 +2,11 @@
 
 A custom Linux kernel driver for the AKAI EIE Pro USB audio interface, providing full audio input/output functionality with multi-format support.
 
+## Known Issues
+Both issue are happening occasionally
+- At the beginning of playing audio there is a really short pluck sound and in first 10 secs also short (~1sec) robot sound overlay
+- When Akai EIE Pro is on and your computer goes to sleep state then on wakeup it freezes (can happen with fresh start also). All is good again on Akai EIE Pro restart. I think problem here is something with pipewire.
+
 ## Backstory
 I bought AKAI EIE Pro while I was using Windows. Soon I switched to Linux and had less time for audio stuff so this thing sat in a box for years until recently I wanted to have a proper mic connected to my computer. I already have one but it is not that modern fancy one with direct USB connection so I need to connect it to some audio interface and AKAI EIE Pro resurrection begins.
 
