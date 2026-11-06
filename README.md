@@ -1,3 +1,6 @@
+THIS IS A FORK OF https://github.com/crnogaj/akai-eie-pro
+Entirely vibe coded fix for ubuntu, that patches periodic digital hiss from the original drivers, not tested on any other distros.
+
 # AKAI EIE Pro USB Audio Driver for Linux
 
 A custom Linux kernel driver for the AKAI EIE Pro USB audio interface, providing full audio input/output functionality with multi-format support.
