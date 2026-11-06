@@ -31,18 +31,38 @@ static DEFINE_MUTEX(devices_mutex);
 static unsigned int devices_used;
 static struct usb_driver eie_driver;
 
-#define SYNC_URB_CNT 2
+/* read-only diagnostics: /sys/module/akai_eie_pro/parameters/ */
+static atomic_t stat_sync_reports = ATOMIC_INIT(0);
+static atomic_t stat_adj_up = ATOMIC_INIT(0);
+static atomic_t stat_adj_down = ATOMIC_INIT(0);
+static atomic_t stat_sync_bad = ATOMIC_INIT(0);
+module_param_named(sync_reports, stat_sync_reports.counter, int, 0444);
+module_param_named(adj_up, stat_adj_up.counter, int, 0444);
+module_param_named(adj_down, stat_adj_down.counter, int, 0444);
+module_param_named(sync_bad, stat_sync_bad.counter, int, 0444);
+
+/*
+ * The clock EP (0x81) sends one report per 1ms. With 2 single-packet URBs
+ * queued, half the reports were lost (measured with usbmon: gaps of 1ms and
+ * 3ms), so the driver could not follow the device clock. Keep 16ms queued.
+ */
+#define SYNC_URB_CNT 4
+#define SYNC_PKT_CNT 4
 #define PLAY_URB_CNT 4
 #define PLAY_PKT_CNT 40
 #define CAP_URB_CNT 2
 
 #define BYTES_PER_FRAME 12
+/* drift is accumulated in 1/1000 frame; reset if sync is clearly broken */
+#define DRIFT_UNIT 1000
+#define DRIFT_LIMIT (50 * DRIFT_UNIT)
 
 enum {
 	PLAYBACK_RUNNING,
 	CAPTURE_RUNNING,
 	URBS_FLOWING,
 	DISCONNECTED,
+	CAP_URBS_FLOWING,
 };
 
 struct eie_playback_urb {
@@ -86,7 +106,7 @@ struct eie {
 	unsigned int cap_frame;          /* Current frame position in ALSA buffer */
 	unsigned int cap_period_pos;     /* Position within current period */
 
-	atomic_t frames_elapsed; /**< frames elapsed as reported by EIE */
+	atomic_t drift; /* device-consumed minus nominal frames, 1/1000 frame */
 	spinlock_t lock;
 	unsigned long states;
 };
@@ -102,7 +122,8 @@ static struct snd_pcm_hardware eie_playback_hw = {
 		SNDRV_PCM_INFO_BLOCK_TRANSFER |
 		SNDRV_PCM_INFO_PAUSE |
 		SNDRV_PCM_INFO_FIFO_IN_FRAMES),
-	.formats = SNDRV_PCM_FMTBIT_S16_LE | SNDRV_PCM_FMTBIT_S24_3LE,
+	/* data path copies 12 bytes/frame = 4ch x 24-bit packed only */
+	.formats = SNDRV_PCM_FMTBIT_S24_3LE,
 	.rates = (SNDRV_PCM_RATE_44100 |
 		SNDRV_PCM_RATE_48000 |
 		SNDRV_PCM_RATE_88200 |
@@ -149,6 +170,7 @@ static void kill_all_urbs(struct eie *eie);
 static int submit_init_play_urbs(struct eie *eie);
 static int submit_init_cap_urbs(struct eie *eie);
 static int submit_init_sync_urbs(struct eie *eie);
+static int start_streaming(struct eie *eie);
 
 static int eie_set_alt_setting(struct eie *eie)
 {
@@ -165,11 +187,19 @@ static int eie_prepare_hw(struct snd_pcm_substream *substream)
 	struct eie *eie = substream->private_data;
 	int err;
 
-	/* Ensure device is properly initialized */
-	err = reset_eie(eie, 48000); /* Default to 48kHz */
-	if (err < 0) {
-		dev_err(&eie->udev->dev, "Failed to initialize device: %d", err);
-		return err;
+	if (test_bit(DISCONNECTED, &eie->states))
+		return -ENODEV;
+
+	/*
+	 * Initialise the device unless the other direction is already
+	 * streaming: a reset kills all URBs, which would cut that stream off.
+	 */
+	if (!test_bit(URBS_FLOWING, &eie->states) || !eie->rate) {
+		err = reset_eie(eie, 48000);
+		if (err < 0) {
+			dev_err(&eie->udev->dev, "Failed to initialize device: %d", err);
+			return err;
+		}
 	}
 
 	/* Set appropriate hardware constraints based on stream direction */
@@ -186,12 +216,15 @@ static int eie_prepare_hw(struct snd_pcm_substream *substream)
 static int eie_ppcm_open(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
 	int err;
 
 	err = eie_prepare_hw(substream);
 	if (err < 0)
 		return err;
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->play_substream = substream;
+	spin_unlock_irqrestore(&eie->lock, flags);
 	
 	/* Set a descriptive name for playback */
 	strcpy(substream->name, "AKAI EIE Pro Playback");
@@ -201,12 +234,15 @@ static int eie_ppcm_open(struct snd_pcm_substream *substream)
 static int eie_cpcm_open(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
 	int err;
 
 	err = eie_prepare_hw(substream);
 	if (err < 0)
 		return err;
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->cap_substream = substream;
+	spin_unlock_irqrestore(&eie->lock, flags);
 	
 	/* Set a descriptive name for capture */
 	strcpy(substream->name, "AKAI EIE Pro Capture");
@@ -216,14 +252,22 @@ static int eie_cpcm_open(struct snd_pcm_substream *substream)
 static int eie_ppcm_close(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
+
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->play_substream = NULL;
+	spin_unlock_irqrestore(&eie->lock, flags);
 	return 0;
 }
 
 static int eie_cpcm_close(struct snd_pcm_substream *substream)
 {
 	struct eie *eie = substream->private_data;
+	unsigned long flags;
+
+	spin_lock_irqsave(&eie->lock, flags);
 	eie->cap_substream = NULL;
+	spin_unlock_irqrestore(&eie->lock, flags);
 	return 0;
 }
 
@@ -313,24 +357,34 @@ static int fill_playback_urb(struct eie_playback_urb *epu)
 	struct eie *eie = epu->eie;
 	struct urb *urb = epu->urb;
 	unsigned int frames_wanted = calc_frames_wanted(eie);
-	unsigned int frames_elapsed = atomic_xchg(&eie->frames_elapsed, 0);
 	unsigned int frames_filled = 0;
 	unsigned int bytes_wanted;
 	unsigned char *start;
 	int i;
 
-	/* Use hardware feedback if reasonable - stable tolerance */
-	if ((frames_elapsed > frames_wanted - 1)
-		&& (frames_elapsed < frames_wanted + 1)
-		&& frames_elapsed > 0) {
-		frames_wanted = frames_elapsed;
+	/*
+	 * Follow the device clock. sync_urb_complete() adds up how far each
+	 * 1ms report deviates from nominal (48 -> 0, 47 -> -1000, 49 -> +1000
+	 * at 48kHz). Once a whole frame has built up, send one frame more or
+	 * less in this 5ms URB, so the device buffer never over/underflows.
+	 */
+	if (atomic_read(&eie->drift) >= DRIFT_UNIT) {
+		atomic_sub(DRIFT_UNIT, &eie->drift);
+		frames_wanted++;
+		atomic_inc(&stat_adj_up);
+	} else if (atomic_read(&eie->drift) <= -DRIFT_UNIT) {
+		atomic_add(DRIFT_UNIT, &eie->drift);
+		frames_wanted--;
+		atomic_inc(&stat_adj_down);
 	}
 	bytes_wanted = BYTES_PER_FRAME * frames_wanted;
 
 	if (bytes_wanted > urb->transfer_buffer_length)
 		return -EINVAL;
 
-	if (test_bit(PLAYBACK_RUNNING, &eie->states)) {
+	if (test_bit(PLAYBACK_RUNNING, &eie->states)
+		&& eie->play_substream && eie->play_substream->runtime
+		&& eie->play_substream->runtime->dma_area) {
 		runtime = eie->play_substream->runtime;
 
 		if (frames_wanted > runtime->buffer_size)
@@ -377,7 +431,7 @@ static bool check_period_elapsed(struct eie *eie)
 {
 	struct snd_pcm_substream *substream = eie->play_substream;
 
-	if (substream != NULL
+	if (substream != NULL && substream->runtime
 		&& eie->played_frames >= substream->runtime->period_size) {
 		eie->played_frames %= substream->runtime->period_size;
 		return true;
@@ -424,15 +478,19 @@ static void play_urb_complete(struct urb *urb)
 {
 	struct eie_playback_urb *epu = urb->context;
 	struct eie *eie = epu->eie;
+	struct snd_pcm_substream *substream = NULL;
 	unsigned long flags;
 	int err;
 	bool elapsed = false;
 	bool abort = false;
 
-	if (urb->status != 0) {
+	/* 0 or a late (missed) iso slot: keep streaming. Anything else: stop. */
+	if (urb->status != 0 && urb->status != -EXDEV) {
 		dev_dbg(&eie->udev->dev, "Play urb complete. %d", urb->status);
 		return;
 	}
+	if (test_bit(DISCONNECTED, &eie->states))
+		return;
 
 	/* first URB */
 	if (!test_and_set_bit(URBS_FLOWING, &eie->states))
@@ -457,6 +515,8 @@ static void play_urb_complete(struct urb *urb)
 
 	elapsed = test_bit(PLAYBACK_RUNNING, &eie->states)
 		&& check_period_elapsed(eie);
+	if (elapsed)
+		substream = eie->play_substream;
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
 	if (err < 0) {
@@ -467,8 +527,8 @@ err:
 	spin_unlock_irqrestore(&eie->lock, flags);
 	
 	/* Period elapsed notification - SAFE: called outside spinlock */
-	if (elapsed)
-		snd_pcm_period_elapsed(eie->play_substream);
+	if (substream)
+		snd_pcm_period_elapsed(substream);
 	if (abort)
 		abort_playback(eie);
 }
@@ -476,7 +536,7 @@ err:
 static void cap_urb_complete(struct urb *urb)
 {
 	struct eie *eie = urb->context;
-	struct snd_pcm_substream *substream = eie->cap_substream;
+	struct snd_pcm_substream *substream;
 	unsigned long flags;
 	int err;
 	bool elapsed = false;
@@ -492,21 +552,28 @@ static void cap_urb_complete(struct urb *urb)
 		success_log_count++;
 	}
 
-	if (!substream)
+	if (test_bit(DISCONNECTED, &eie->states)) {
+		clear_bit(CAP_URBS_FLOWING, &eie->states);
 		return;
+	}
 
 	if (urb->status) {
 		if (urb->status == -ENOENT || /* unlinked */
 		    urb->status == -ECONNRESET || /* unlinked */
-		    urb->status == -ESHUTDOWN) /* device disabled */
+		    urb->status == -ESHUTDOWN || /* device disabled */
+		    urb->status == -ENODEV) {
+			clear_bit(CAP_URBS_FLOWING, &eie->states);
 			return;
+		}
 
 		dev_dbg(&eie->udev->dev, "cap urb status: %d", urb->status);
 	}
 
 	spin_lock_irqsave(&eie->lock, flags);
+	substream = eie->cap_substream;
 
-	if (test_bit(CAPTURE_RUNNING, &eie->states) && substream) {
+	if (test_bit(CAPTURE_RUNNING, &eie->states) && substream
+		&& substream->runtime && substream->runtime->dma_area) {
 		struct snd_pcm_runtime *runtime = substream->runtime;
 		
 		/* Process any received bulk data */
@@ -625,6 +692,8 @@ static void cap_urb_complete(struct urb *urb)
 	}
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
+	if (err < 0)
+		clear_bit(CAP_URBS_FLOWING, &eie->states);
 	if (err < 0) {
 		/* Reduce log spam - only log serious errors */
 		if (err != -ENODEV && err != -ESHUTDOWN && err != -ENOENT && err != -EPERM) {
@@ -650,8 +719,8 @@ static void cap_urb_complete(struct urb *urb)
 	spin_unlock_irqrestore(&eie->lock, flags);
 	
 	/* Period elapsed notification */
-	if (elapsed)
-		snd_pcm_period_elapsed(eie->cap_substream);
+	if (elapsed && substream)
+		snd_pcm_period_elapsed(substream);
 	if (abort)
 		abort_capture(eie);
 }
@@ -662,29 +731,36 @@ static void sync_urb_complete(struct urb *urb)
 	int i;
 	int err;
 
-	if (urb->status != 0) {
+	unsigned int rate = READ_ONCE(eie->rate);
+
+	if (urb->status != 0 && urb->status != -EXDEV) {
 		dev_dbg(&eie->udev->dev, "Sync urb complete. status = %d, packets = %d",
 			urb->status, urb->number_of_packets);
 		return;
 	}
+	if (test_bit(DISCONNECTED, &eie->states))
+		return;
 
 	for (i = 0; i < urb->number_of_packets; i++) {
-		if (urb->iso_frame_desc[i].actual_length > 0) {
-			unsigned char *buf = urb->transfer_buffer;
-			unsigned int offset = urb->iso_frame_desc[i].offset;
-			unsigned char d = buf[offset];
+		unsigned char *buf = urb->transfer_buffer;
+		int dev;
 
-			if (d == 0) {
-				/* the device did not advance clock - skip this sync packet */
-				dev_dbg(&eie->udev->dev, "EIE sync: device clock not advancing");
-			} else if (d > 0 && d < 50) {
-				/* Only accept reasonable sync values to reduce timing jitter */
-				atomic_add(d, &eie->frames_elapsed);
-			} else {
-				/* Ignore unreasonable sync values that could cause glitches */
-				dev_dbg(&eie->udev->dev, "EIE sync: ignoring value %d", d);
-			}
+		if (urb->iso_frame_desc[i].status != 0
+			|| urb->iso_frame_desc[i].actual_length < 1)
+			continue;
+
+		/* frames the card played during the last 1ms vs. nominal */
+		dev = (int)buf[urb->iso_frame_desc[i].offset] * DRIFT_UNIT
+			- (int)rate;
+		if (!rate || dev < -5 * DRIFT_UNIT || dev > 5 * DRIFT_UNIT) {
+			/* rate switch, stalled clock or garbage */
+			atomic_inc(&stat_sync_bad);
+			continue;
 		}
+		atomic_inc(&stat_sync_reports);
+		dev = atomic_add_return(dev, &eie->drift);
+		if (dev > DRIFT_LIMIT || dev < -DRIFT_LIMIT)
+			atomic_set(&eie->drift, 0);
 	}
 
 	err = usb_submit_urb(urb, GFP_ATOMIC);
@@ -744,7 +820,6 @@ static int eie_ppcm_prepare(struct snd_pcm_substream *substream)
 	
 	/* Reset timing state for clean startup */
 	eie->wanted_idx = 0;
-	atomic_set(&eie->frames_elapsed, 0);
 
 	return err;
 }
@@ -796,6 +871,10 @@ static int submit_init_cap_urbs(struct eie *eie)
 	int err = 0;
 	int i;
 
+	/* already running from an earlier start: they never stopped */
+	if (test_and_set_bit(CAP_URBS_FLOWING, &eie->states))
+		return 0;
+
 	spin_lock_irqsave(&eie->lock, flags);
 
 	/* Reset capture position tracking */
@@ -818,6 +897,12 @@ static int submit_init_cap_urbs(struct eie *eie)
 
 out:
 	spin_unlock_irqrestore(&eie->lock, flags);
+	if (err < 0) {
+		for (i = 0; i < CAP_URB_CNT; i++)
+			if (eie->cap_urbs[i])
+				usb_unlink_urb(eie->cap_urbs[i]);
+		clear_bit(CAP_URBS_FLOWING, &eie->states);
+	}
 	return err;
 }
 
@@ -829,19 +914,15 @@ static int eie_ppcm_trigger(struct snd_pcm_substream *substream, int cmd)
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
 		/* Submit URBs when playback actually starts */
+		if (test_bit(DISCONNECTED, &eie->states))
+			return -ENODEV;
+		if (!eie->rate)
+			return -EIO;
+		/* trigger runs in atomic context: never sleep here */
 		if (!test_bit(URBS_FLOWING, &eie->states)) {
-			if (eie->sync_endpoint_addr) {
-				err = submit_init_sync_urbs(eie);
-				if (err < 0)
-					return err;
-			}
-			err = submit_init_play_urbs(eie);
+			err = start_streaming(eie);
 			if (err < 0)
 				return err;
-			wait_event(eie->urbs_flow_wait, test_bit(URBS_FLOWING, &eie->states));
-			
-			/* Small delay to let hardware stabilize and avoid initial plucks */
-			usleep_range(1000, 2000);  /* 1-2ms stabilization delay */
 		}
 		
 		set_bit(PLAYBACK_RUNNING, &eie->states);
@@ -867,31 +948,21 @@ static int eie_cpcm_trigger(struct snd_pcm_substream *substream, int cmd)
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		/* Ensure device is configured for the current sample rate */
-		if (substream->runtime->rate != eie->rate) {
-			err = reset_eie(eie, substream->runtime->rate);
-			if (err < 0) {
-				dev_err(&eie->udev->dev, "Failed to configure device for capture: %d", err);
-				return err;
-			}
-		}
-		
-		/* CRITICAL: Device needs both playbook and capture URBs running for capture to work */
+		if (test_bit(DISCONNECTED, &eie->states))
+			return -ENODEV;
+		/*
+		 * trigger runs in atomic context: we must not reset the device
+		 * (that sleeps). prepare() already configured the rate; if it
+		 * changed since, fail and let ALSA re-prepare.
+		 */
+		if (!eie->rate || substream->runtime->rate != eie->rate)
+			return -EIO;
+
+		/* Device needs playback URBs running for capture to work */
 		if (!test_bit(URBS_FLOWING, &eie->states)) {
-			/* Start playback URBs first */
-			if (eie->sync_endpoint_addr) {
-				err = submit_init_sync_urbs(eie);
-				if (err < 0) {
-					dev_err(&eie->udev->dev, "Failed to start sync URBs for capture: %d", err);
-					return err;
-				}
-			}
-			err = submit_init_play_urbs(eie);
-			if (err < 0) {
-				dev_err(&eie->udev->dev, "Failed to start playbook URBs for capture: %d", err);
+			err = start_streaming(eie);
+			if (err < 0)
 				return err;
-			}
-			wait_event(eie->urbs_flow_wait, test_bit(URBS_FLOWING, &eie->states));
 		}
 		
 		set_bit(CAPTURE_RUNNING, &eie->states);
@@ -969,14 +1040,41 @@ static int submit_init_sync_urbs(struct eie *eie)
 	int i;
 
 	for (i = 0; i < SYNC_URB_CNT; i++) {
-		err = usb_submit_urb(eie->sync_urbs[i], GFP_KERNEL);
+		if (!eie->sync_urbs[i])
+			continue;
+		err = usb_submit_urb(eie->sync_urbs[i], GFP_ATOMIC);
 		if (err < 0) {
 			dev_err(&eie->udev->dev, "USB sync URB error %d", err);
 			return err;
 		}
 	}
+	return 0;
+}
 
-	dev_info(&eie->udev->dev, "Submitted sync urbs.");
+/* Called from trigger (atomic). On failure, unlink whatever was submitted. */
+static int start_streaming(struct eie *eie)
+{
+	int err = 0;
+	int i;
+
+	for (i = 0; i < PLAY_URB_CNT; i++)
+		if (!eie->play_urbs[i].urb)
+			return -ENODEV;
+
+	atomic_set(&eie->drift, 0);
+	if (eie->sync_endpoint_addr)
+		err = submit_init_sync_urbs(eie);
+	if (err == 0)
+		err = submit_init_play_urbs(eie);
+	if (err < 0) {
+		for (i = 0; i < PLAY_URB_CNT; i++)
+			usb_unlink_urb(eie->play_urbs[i].urb);
+		for (i = 0; i < SYNC_URB_CNT; i++)
+			if (eie->sync_urbs[i])
+				usb_unlink_urb(eie->sync_urbs[i]);
+		return err;
+	}
+	set_bit(URBS_FLOWING, &eie->states);
 	return 0;
 }
 
@@ -1005,6 +1103,7 @@ static void kill_all_urbs(struct eie *eie)
 	
 	/* Clear the URBS_FLOWING state when URBs are killed */
 	clear_bit(URBS_FLOWING, &eie->states);
+	clear_bit(CAP_URBS_FLOWING, &eie->states);
 }
 
 static void kill_and_free_urb(struct eie *eie, struct urb **urbp)
@@ -1092,20 +1191,21 @@ static int init_sync_urbs(struct eie *eie, struct usb_endpoint_descriptor *endpo
 {
 	unsigned char *buf;
 	struct urb *urb;
-	int j;
+	int i, j;
 	int err = 0;
 
 	eie->sync_packet_size = usb_endpoint_maxp(endpoint);
 	eie->sync_endpoint_addr = endpoint->bEndpointAddress;
 
 	for (j = 0; j < SYNC_URB_CNT; j++) {
-		urb = usb_alloc_urb(1, GFP_KERNEL);
+		urb = usb_alloc_urb(SYNC_PKT_CNT, GFP_KERNEL);
 		if (urb == NULL) {
 			err = -ENOMEM;
 			break;
 		}
 
-		buf = usb_alloc_coherent(eie->udev, eie->sync_packet_size,
+		buf = usb_alloc_coherent(eie->udev,
+			SYNC_PKT_CNT * eie->sync_packet_size,
 			GFP_KERNEL, &urb->transfer_dma);
 		if (buf == NULL) {
 			usb_free_urb(urb);
@@ -1117,13 +1217,15 @@ static int init_sync_urbs(struct eie *eie, struct usb_endpoint_descriptor *endpo
 		urb->pipe = usb_rcvisocpipe(eie->udev, eie->sync_endpoint_addr);
 		urb->transfer_flags = URB_NO_TRANSFER_DMA_MAP;
 		urb->transfer_buffer = buf;
-		urb->transfer_buffer_length = eie->sync_packet_size;
-		urb->number_of_packets = 1;
-		urb->interval = 1;
+		urb->transfer_buffer_length = SYNC_PKT_CNT * eie->sync_packet_size;
+		urb->number_of_packets = SYNC_PKT_CNT;
+		urb->interval = 1 << (clamp_t(int, endpoint->bInterval, 1, 16) - 1);
 		urb->context = eie;
 		urb->complete = sync_urb_complete;
-		urb->iso_frame_desc[0].offset = 0;
-		urb->iso_frame_desc[0].length = eie->sync_packet_size;
+		for (i = 0; i < SYNC_PKT_CNT; i++) {
+			urb->iso_frame_desc[i].offset = i * eie->sync_packet_size;
+			urb->iso_frame_desc[i].length = eie->sync_packet_size;
+		}
 
 		eie->sync_urbs[j] = urb;
 	}
@@ -1194,12 +1296,10 @@ static int init_urbs(struct eie *eie)
 		endpoint = &iface_desc->endpoint[i].desc;
 
 		if (!eie->sync_endpoint_addr && usb_endpoint_is_isoc_in(endpoint)) {
-			/* Check if this is the sync endpoint (typically smaller) */
-			if (usb_endpoint_maxp(endpoint) < 64) {
-				err = init_sync_urbs(eie, endpoint);
-				if (err < 0)
-					return err;
-			}
+			/* EP 0x81 (isoc in) is the clock feedback endpoint */
+			err = init_sync_urbs(eie, endpoint);
+			if (err < 0)
+				return err;
 		}
 		
 		/* Look specifically for endpoint 0x86 for capture */
@@ -1262,6 +1362,10 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 	struct snd_card *card;
 	struct eie *eie;
 	int err;
+
+	/* interface 1 is claimed by the interface 0 probe */
+	if (interface->cur_altsetting->desc.bInterfaceNumber != 0)
+		return -ENODEV;
 
 	mutex_lock(&devices_mutex);
 
@@ -1342,13 +1446,17 @@ static int eie_probe(struct usb_interface *interface, const struct usb_device_id
 		}
 	}
 
+	/* URBs must exist before userspace can open the card */
+	err = init_urbs(eie);
+	if (err < 0)
+		goto probe_err;
+
+	usb_set_intfdata(interface, eie);
+
 	err = snd_card_register(card);
 	if (err < 0)
 		goto probe_err;
 
-	init_urbs(eie);
-
-	usb_set_intfdata(interface, eie);
 	devices_used |= 1 << card_index;
 
 	mutex_unlock(&devices_mutex);
@@ -1375,7 +1483,10 @@ static void eie_disconnect(struct usb_interface *interface)
 	set_bit(DISCONNECTED, &eie->states);
 	wake_up(&eie->urbs_flow_wait);
 
+	/* stops running streams and blocks new opens/ioctls */
+	snd_card_disconnect(eie->card);
 	free_usb_related_resources(eie);
+	devices_used &= ~(1 << eie->card_index);
 	snd_card_free_when_closed(eie->card);
 
 	mutex_unlock(&devices_mutex);
